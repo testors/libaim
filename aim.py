@@ -16,12 +16,16 @@ See docs/wifi_protocol.md for the protocol spec this implements.
 from __future__ import annotations
 
 import argparse
+import datetime
+import hashlib
 import os
+import platform
 import socket
 import struct
 import sys
 import time
-from typing import Optional
+import traceback
+from typing import Callable, Optional
 
 from libaim.telemetry import build_session, decode_session_bytes, looks_like_zlib
 from libaim.wifi import (
@@ -33,6 +37,60 @@ from libaim.wifi import (
     discover,
     parse_session_list,
 )
+
+
+TraceCallback = Callable[[str], None]
+
+
+class _DebugLog:
+    def __init__(self, path: str):
+        self.path = os.fspath(path)
+        directory = os.path.dirname(os.path.abspath(self.path))
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        self._handle = open(self.path, "w", encoding="utf-8", buffering=1)
+
+    def write(self, msg: str) -> None:
+        stamp = datetime.datetime.now().astimezone().isoformat(timespec="milliseconds")
+        lines = str(msg).splitlines() or [""]
+        for line in lines:
+            self._handle.write(f"{stamp} {line}\n")
+        self._handle.flush()
+
+    def close(self) -> None:
+        self._handle.close()
+
+
+def _debug(trace: Optional[TraceCallback], msg: str) -> None:
+    if trace is not None:
+        trace(msg)
+
+
+def _debug_exception(trace: Optional[TraceCallback], label: str) -> None:
+    if trace is not None:
+        trace(f"{label}: {traceback.format_exc().rstrip()}")
+
+
+def _debug_blob(trace: Optional[TraceCallback], label: str, data: bytes) -> None:
+    if trace is None:
+        return
+    digest = hashlib.sha256(data).hexdigest()
+    head = data[:64].hex()
+    tail = data[-64:].hex() if len(data) > 64 else ""
+    tail_part = f" tail64={tail}" if tail else ""
+    trace(f"{label}: bytes={len(data)} sha256={digest} head64={head}{tail_part}")
+
+
+def _debug_sessions(trace: Optional[TraceCallback], label: str, sessions: list[Session]) -> None:
+    if trace is None:
+        return
+    trace(f"{label}: parsed_sessions={len(sessions)}")
+    for idx, session in enumerate(sessions, 1):
+        trace(
+            f"{label}[{idx}] name={session.name!r} size={session.size} "
+            f"date={session.date!r} hour={session.hour!r} laps={session.nlap!r} "
+            f"track={session.track_name!r}"
+        )
 
 
 def _find_session_by_name(sessions: list[Session], name: str) -> Optional[Session]:
@@ -181,8 +239,11 @@ class _ProgressBar:
 
 
 def cmd_discover(args: argparse.Namespace) -> int:
+    trace = getattr(args, "trace", None)
     hosts = [args.host] if args.host else None
-    devices = discover(timeout=args.timeout, hosts=hosts, verbose=args.verbose)
+    _debug(trace, f"cmd_discover start host={args.host!r} timeout={args.timeout}")
+    devices = discover(timeout=args.timeout, hosts=hosts, verbose=args.verbose, trace=trace)
+    _debug(trace, f"cmd_discover found={len(devices)}")
     if not devices:
         print(
             "no AiM device found (probed aim-ka to "
@@ -196,9 +257,13 @@ def cmd_discover(args: argparse.Namespace) -> int:
 
 
 def cmd_list(args: argparse.Namespace) -> int:
-    with AimSession(host=args.host, timeout=args.timeout, verbose=args.verbose) as session:
+    trace = getattr(args, "trace", None)
+    _debug(trace, f"cmd_list start host={args.host!r} timeout={args.timeout}")
+    with AimSession(host=args.host, timeout=args.timeout, verbose=args.verbose, trace=trace) as session:
         csv_text = session.fetch_list_csv()
     sessions = parse_session_list(csv_text)
+    _debug(trace, f"cmd_list csv_chars={len(csv_text)} raw_csv={args.raw_csv} json={args.json}")
+    _debug_sessions(trace, "cmd_list sessions", sessions)
 
     if args.raw_csv:
         sys.stdout.write(csv_text)
@@ -244,28 +309,41 @@ def _resolve_targets(sessions: list[Session], names: list[str], all_flag: bool) 
 
 
 def cmd_download(args: argparse.Namespace) -> int:
+    trace = getattr(args, "trace", None)
     out_dir = args.out or "."
     os.makedirs(out_dir, exist_ok=True)
+    _debug(
+        trace,
+        f"cmd_download start host={args.host!r} timeout={args.timeout} out={out_dir!r} "
+        f"all={args.all} force={args.force} names={args.names!r}",
+    )
 
-    with AimSession(host=args.host, timeout=args.timeout, verbose=args.verbose) as session:
+    with AimSession(host=args.host, timeout=args.timeout, verbose=args.verbose, trace=trace) as session:
         csv_text = session.fetch_list_csv()
         sessions = parse_session_list(csv_text)
+        _debug(trace, f"cmd_download list csv_chars={len(csv_text)}")
+        _debug_sessions(trace, "cmd_download list", sessions)
 
         if not sessions:
             print("no sessions on device", file=sys.stderr)
             return 1
 
         targets = _resolve_targets(sessions, args.names, args.all)
+        _debug_sessions(trace, "cmd_download targets", targets)
         if not targets:
             print("error: specify session name(s) or --all", file=sys.stderr)
             return 2
 
         active_target = _find_latest_session(sessions)
+        if active_target is not None:
+            _debug(trace, f"cmd_download active_target={active_target.name!r}")
         total_ok = 0
         for target in targets:
+            _debug(trace, f"download target start name={target.name!r} remote={target.remote_path!r}")
             try:
                 local_name = _safe_output_name(target.name)
             except ValueError as exc:
+                _debug(trace, f"download target unsafe name={target.name!r}: {exc}")
                 print(f"fail  {target.name}: {exc}", file=sys.stderr)
                 continue
             previous_size = target.size
@@ -276,6 +354,7 @@ def cmd_download(args: argparse.Namespace) -> int:
                         target.name,
                     )
                 except (ProtocolError, ConnectionError, socket.timeout, OSError, ValueError) as exc:
+                    _debug_exception(trace, f"download refresh failed target={target.name!r}")
                     print(
                         f"fail  {target.name}: could not refresh list before download: {exc}",
                         file=sys.stderr,
@@ -283,6 +362,7 @@ def cmd_download(args: argparse.Namespace) -> int:
                     try:
                         session.reset()
                     except (ProtocolError, ConnectionError, socket.timeout, OSError, ValueError) as reset_exc:
+                        _debug_exception(trace, f"download reset failed after refresh target={target.name!r}")
                         print(
                             f"error: could not recover TCP session after failure: {reset_exc}",
                             file=sys.stderr,
@@ -290,6 +370,7 @@ def cmd_download(args: argparse.Namespace) -> int:
                         return 1
                     continue
                 if fresh is None:
+                    _debug(trace, f"download target disappeared after refresh name={target.name!r}")
                     print(
                         f"fail  {target.name}: session no longer present in refreshed list",
                         file=sys.stderr,
@@ -301,6 +382,7 @@ def cmd_download(args: argparse.Namespace) -> int:
             dst = os.path.join(out_dir, local_name)
             if os.path.exists(dst) and not args.force:
                 st = os.stat(dst)
+                _debug(trace, f"download existing dst={dst!r} size={st.st_size} expected={expected_size}")
                 if st.st_size == expected_size:
                     print(f"skip  {target.name}  (already exists, size matches)")
                     total_ok += 1
@@ -312,6 +394,11 @@ def cmd_download(args: argparse.Namespace) -> int:
                 )
                 continue
             if size_changed:
+                _debug(
+                    trace,
+                    f"download target size changed name={target.name!r} "
+                    f"previous={previous_size} expected={expected_size}",
+                )
                 print(
                     f"warn  {target.name}: list size changed {previous_size} -> {expected_size}; "
                     "session appears to still be recording",
@@ -329,10 +416,12 @@ def cmd_download(args: argparse.Namespace) -> int:
                 read = session.read_file_result(target.remote_path, progress=progress)
                 data = read.data
             except (ProtocolError, ConnectionError, socket.timeout, OSError, ValueError) as exc:
+                _debug_exception(trace, f"download read failed target={target.name!r}")
                 print(f"fail  {target.name}: {exc}", file=sys.stderr)
                 try:
                     session.reset()
                 except (ProtocolError, ConnectionError, socket.timeout, OSError, ValueError) as reset_exc:
+                    _debug_exception(trace, f"download reset failed after read target={target.name!r}")
                     print(
                         f"error: could not recover TCP session after failure: {reset_exc}",
                         file=sys.stderr,
@@ -345,6 +434,8 @@ def cmd_download(args: argparse.Namespace) -> int:
                     # that the logger appended/finalized the file mid-download.
                     _validate_downloaded_session(target.name, data)
                 except (OSError, ValueError, struct.error) as parse_exc:
+                    _debug_blob(trace, f"download mismatch data {target.name}", data)
+                    _debug_exception(trace, f"download mismatch parse failed target={target.name!r}")
                     print(
                         f"fail  {target.name}: size mismatch "
                         f"(got {len(data)}, list {expected_size}, ready {read.ready_size}); "
@@ -370,6 +461,12 @@ def cmd_download(args: argparse.Namespace) -> int:
                     f"got={len(data)} list={expected_size} ready={read.ready_size}",
                     file=sys.stderr,
                 )
+            _debug_blob(trace, f"download data {target.name}", data)
+            _debug(
+                trace,
+                f"download result name={target.name!r} got={len(data)} "
+                f"list={expected_size} ready={read.ready_size} dst={dst!r}",
+            )
             tmp = dst + ".part"
             with open(tmp, "wb") as handle:
                 handle.write(data)
@@ -381,16 +478,25 @@ def cmd_download(args: argparse.Namespace) -> int:
 
 
 def cmd_delete(args: argparse.Namespace) -> int:
-    with AimSession(host=args.host, timeout=args.timeout, verbose=args.verbose) as session:
+    trace = getattr(args, "trace", None)
+    _debug(
+        trace,
+        f"cmd_delete start host={args.host!r} timeout={args.timeout} "
+        f"all={args.all} names={args.names!r}",
+    )
+    with AimSession(host=args.host, timeout=args.timeout, verbose=args.verbose, trace=trace) as session:
         csv_text = session.fetch_list_csv()
         sessions = parse_session_list(csv_text)
         host = session.host
+    _debug(trace, f"cmd_delete list csv_chars={len(csv_text)} host={host!r}")
+    _debug_sessions(trace, "cmd_delete list", sessions)
 
     if not sessions:
         print("no sessions on device", file=sys.stderr)
         return 1
 
     targets = _resolve_targets(sessions, args.names, args.all)
+    _debug_sessions(trace, "cmd_delete targets", targets)
     if not targets:
         print("error: specify session name(s) or --all", file=sys.stderr)
         return 2
@@ -406,15 +512,23 @@ def cmd_delete(args: argparse.Namespace) -> int:
 
     deleted_names: list[str] = []
     total_ok = 0
-    with AimSession(host=host, timeout=args.timeout, verbose=args.verbose, bootstrap=False) as session:
+    with AimSession(
+        host=host,
+        timeout=args.timeout,
+        verbose=args.verbose,
+        bootstrap=False,
+        trace=trace,
+    ) as session:
         for target in targets:
             try:
                 status = session.delete_file(target.remote_path)
             except (ProtocolError, ConnectionError, socket.timeout, OSError, ValueError) as exc:
+                _debug_exception(trace, f"delete failed target={target.name!r}")
                 print(f"fail  {target.name}: {exc}", file=sys.stderr)
                 try:
                     session.reset()
                 except (ProtocolError, ConnectionError, socket.timeout, OSError, ValueError) as reset_exc:
+                    _debug_exception(trace, f"delete reset failed target={target.name!r}")
                     print(
                         f"error: could not recover TCP session after failure: {reset_exc}",
                         file=sys.stderr,
@@ -434,8 +548,10 @@ def cmd_delete(args: argparse.Namespace) -> int:
             try:
                 remaining = parse_session_list(session.fetch_plain_list_csv())
             except (ProtocolError, ConnectionError, socket.timeout, OSError, ValueError) as exc:
+                _debug_exception(trace, "delete verification failed")
                 print(f"error: could not verify deleted sessions: {exc}", file=sys.stderr)
                 return 1
+            _debug_sessions(trace, "cmd_delete remaining", remaining)
             remaining_names = {item.name for item in remaining}
             for name in deleted_names:
                 if name in remaining_names:
@@ -446,8 +562,11 @@ def cmd_delete(args: argparse.Namespace) -> int:
 
 
 def cmd_info(args: argparse.Namespace) -> int:
-    with AimSession(host=args.host, timeout=args.timeout, verbose=args.verbose) as session:
+    trace = getattr(args, "trace", None)
+    _debug(trace, f"cmd_info start host={args.host!r} timeout={args.timeout}")
+    with AimSession(host=args.host, timeout=args.timeout, verbose=args.verbose, trace=trace) as session:
         blob = session.fetch_device_info()
+    _debug_blob(trace, "cmd_info device_info", blob)
     if not blob:
         print("no device info returned", file=sys.stderr)
         return 1
@@ -490,6 +609,15 @@ def cmd_info(args: argparse.Namespace) -> int:
     return 0
 
 
+def _add_debug_log_argument(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--debug-log",
+        default=os.environ.get("AIM_DEBUG_LOG"),
+        metavar="PATH",
+        help="Write detailed offline protocol/debug log to PATH (or set AIM_DEBUG_LOG).",
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="aim",
@@ -504,6 +632,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Probe a single host/broadcast (default: 10/11/12/14.0.0.1 + 255.255.255.255)",
     )
     discover_parser.add_argument("--timeout", type=float, default=2.0, help="Seconds to listen.")
+    _add_debug_log_argument(discover_parser)
     discover_parser.add_argument(
         "-v",
         "--verbose",
@@ -512,13 +641,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     discover_parser.set_defaults(func=cmd_discover)
 
-    list_parser = sub.add_parser("list", help="List recorded sessions.")
+    list_parser = sub.add_parser("list", aliases=["sessions"], help="List recorded sessions.")
     list_parser.add_argument(
         "--host",
         default=None,
         help="Logger IP. If omitted, auto-discover among known AP IPs.",
     )
     list_parser.add_argument("--timeout", type=float, default=15.0)
+    _add_debug_log_argument(list_parser)
     list_parser.add_argument(
         "-v",
         "--verbose",
@@ -545,6 +675,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Logger IP. If omitted, auto-discover among known AP IPs.",
     )
     download_parser.add_argument("--timeout", type=float, default=30.0)
+    _add_debug_log_argument(download_parser)
     download_parser.add_argument("-o", "--out", default=".", help="Output directory.")
     download_parser.add_argument("--all", action="store_true", help="Download every session.")
     download_parser.add_argument(
@@ -573,6 +704,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Logger IP. If omitted, auto-discover among known AP IPs.",
     )
     delete_parser.add_argument("--timeout", type=float, default=30.0)
+    _add_debug_log_argument(delete_parser)
     delete_parser.add_argument("--all", action="store_true", help="Delete every session.")
     delete_parser.add_argument(
         "-y",
@@ -600,6 +732,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Logger IP. If omitted, auto-discover among known AP IPs.",
     )
     info_parser.add_argument("--timeout", type=float, default=15.0)
+    _add_debug_log_argument(info_parser)
     info_parser.add_argument("-v", "--verbose", action="store_true", help="Trace every TCP frame.")
     info_parser.set_defaults(func=cmd_info)
 
@@ -609,17 +742,62 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[list[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    debug_log = None
+    trace: Optional[TraceCallback] = None
+    rc = 1
+    debug_path = getattr(args, "debug_log", None)
+    if debug_path:
+        try:
+            debug_log = _DebugLog(debug_path)
+        except OSError as exc:
+            print(f"error: could not open debug log {debug_path!r}: {exc}", file=sys.stderr)
+            return 2
+        trace = debug_log.write
+        args.trace = trace
+        argv_for_log = sys.argv if argv is None else [sys.argv[0], *argv]
+        trace("debug log opened")
+        trace(f"path={os.path.abspath(debug_log.path)!r}")
+        trace(f"argv={argv_for_log!r}")
+        trace(f"cwd={os.getcwd()!r}")
+        trace(f"python={sys.version.split()[0]} platform={platform.platform()!r}")
+        trace(f"command={args.command!r}")
+        trace(
+            "args="
+            + repr(
+                {
+                    key: value
+                    for key, value in vars(args).items()
+                    if key not in ("func", "trace")
+                }
+            )
+        )
+    else:
+        args.trace = None
     try:
-        return args.func(args)
+        rc = args.func(args)
+        return rc
     except KeyboardInterrupt:
+        rc = 130
+        _debug(trace, "keyboard interrupt")
         print("\ninterrupted", file=sys.stderr)
         return 130
     except ProtocolError as exc:
+        rc = 1
+        _debug_exception(trace, "protocol error")
         print(f"protocol error: {exc}", file=sys.stderr)
         return 1
     except (ConnectionError, socket.timeout, OSError) as exc:
+        rc = 1
+        _debug_exception(trace, "network error")
         print(f"network error: {exc}", file=sys.stderr)
         return 1
+    except Exception:
+        _debug_exception(trace, "unhandled exception")
+        raise
+    finally:
+        _debug(trace, f"exit rc={rc}")
+        if debug_log is not None:
+            debug_log.close()
 
 
 if __name__ == "__main__":

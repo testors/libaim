@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import csv
 import io
+import re
 import socket
 import struct
 import sys
 import threading
 import time
 from dataclasses import dataclass
-from typing import Iterable, Optional
+from typing import Callable, Iterable, Optional
 
 
 # IMPORTANT: AiM AP IP is configurable on-device; do not hardcode 10.0.0.1.
@@ -44,6 +45,7 @@ KEEPALIVE_PRIME_DELAY = 0.1
 # sent immediately after TCP connect. A short post-connect settle delay makes
 # the bootstrap reliable and matches the vendor capture timing.
 CONNECT_SETTLE_DELAY = 0.4
+HELLO_REPLY_CODES = (b"\x06\x09", b"\x06\x19")
 
 CMD_DEVINFO = (0x10, 0x01)
 CMD_SYNC_PING = (0x06, 0x01)
@@ -55,6 +57,35 @@ DEVINFO_REQ_SIZE = HDR_SIZE
 
 RECORDED_DIR = "1:/mem"
 LIST_CACHE_PATH = "0:/tkk/dev.ria"
+SESSION_LIST_COLUMNS = [
+    "name",
+    "size",
+    "date",
+    "hour",
+    "nlap",
+    "nbest",
+    "best",
+    "pilota",
+    "track_name",
+    "veicolo",
+    "campionato",
+    "venue_type",
+    "mode",
+    "trk_type",
+    "motivolap",
+    "maxvel",
+    "device",
+    "track_lat",
+    "track_lon",
+    "test_dur",
+    "pname",
+    "ptype",
+    "ptime",
+    "pdist",
+    "pmaxv",
+]
+SESSION_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+TraceCallback = Callable[[str], None]
 
 
 class ProtocolError(Exception):
@@ -84,11 +115,16 @@ def wrap_frame(tag: bytes, payload: bytes) -> bytes:
 class FrameReader:
     """Reads STCP/STNC frames from a TCP stream, handling segment/frame mismatch."""
 
-    def __init__(self, sock: socket.socket, on_recv=None):
+    def __init__(self, sock: socket.socket, on_recv=None, trace: Optional[TraceCallback] = None):
         self.sock = sock
         self.buf = bytearray()
         # optional callback(chunk: bytes) invoked for every raw recv()
         self.on_recv = on_recv
+        self.trace = trace
+
+    def _trace(self, msg: str) -> None:
+        if self.trace is not None:
+            self.trace(msg)
 
     def _recv_more(self, n: int = 65536) -> None:
         chunk = self.sock.recv(n)
@@ -104,10 +140,13 @@ class FrameReader:
                 self._recv_more()
             except socket.timeout:
                 if self.buf:
-                    sys.stderr.write(
-                        f"  [aim] timed out with {len(self.buf)}B partial data "
-                        f"in buffer: {bytes(self.buf).hex()}\n"
+                    msg = (
+                        f"timed out with {len(self.buf)}B partial data "
+                        f"in buffer: {bytes(self.buf).hex()}"
                     )
+                    self._trace(msg)
+                    if self.trace is None:
+                        sys.stderr.write(f"  [aim] {msg}\n")
                 raise
 
     def _seek_frame_start(self) -> None:
@@ -117,11 +156,20 @@ class FrameReader:
             if idx == 0:
                 return
             if idx > 0:
+                self._trace(
+                    f"discarding {idx}B before frame start: {bytes(self.buf[:idx]).hex()}"
+                )
                 del self.buf[:idx]
                 return
             if self.buf[-1:] == b"<":
+                if len(self.buf) > 1:
+                    self._trace(
+                        f"discarding {len(self.buf) - 1}B garbage before trailing '<': "
+                        f"{bytes(self.buf[:-1]).hex()}"
+                    )
                 del self.buf[:-1]
             else:
+                self._trace(f"discarding {len(self.buf)}B garbage: {bytes(self.buf).hex()}")
                 del self.buf[:]
             self._recv_more()
 
@@ -133,6 +181,10 @@ class FrameReader:
             tag = bytes(self.buf[2:6])
             plen = int.from_bytes(self.buf[6:10], "little")
             if self.buf[10:12] != b"\x00>":
+                self._trace(
+                    f"bad frame header terminator tag={tag!r} plen={plen} "
+                    f"term={bytes(self.buf[10:12]).hex()}; shifting by 1B"
+                )
                 del self.buf[:1]
                 continue
 
@@ -142,14 +194,26 @@ class FrameReader:
             payload = bytes(self.buf[12:12 + plen])
             off = 12 + plen
             if self.buf[off:off + 1] != b"<" or self.buf[off + 1:off + 5] != tag:
+                self._trace(
+                    f"bad frame trailer tag={tag!r} plen={plen} "
+                    f"trailer={bytes(self.buf[off:off + 8]).hex()}; shifting by 1B"
+                )
                 del self.buf[:1]
                 continue
             chk = int.from_bytes(self.buf[off + 5:off + 7], "little")
             if self.buf[off + 7:off + 8] != b">":
+                self._trace(
+                    f"bad frame checksum terminator tag={tag!r} plen={plen} "
+                    f"term={bytes(self.buf[off + 7:off + 8]).hex()}; shifting by 1B"
+                )
                 del self.buf[:1]
                 continue
             expected = sum(payload) & 0xFFFF
             if chk != expected:
+                self._trace(
+                    f"checksum mismatch tag={tag!r} plen={plen}: "
+                    f"got {chk:#06x}, want {expected:#06x}"
+                )
                 raise ProtocolError(f"checksum mismatch: got {chk:#06x}, want {expected:#06x}")
 
             del self.buf[:total]
@@ -215,7 +279,7 @@ def _make_timesync_payload(now: Optional[time.struct_time] = None) -> bytes:
 class _UdpKeepalive:
     """Periodic UDP `aim-ka` sender for the lifetime of a TCP session."""
 
-    def __init__(self, host: str, trace) -> None:
+    def __init__(self, host: str, trace: TraceCallback) -> None:
         self.host = host
         self._trace = trace
         self._sock: Optional[socket.socket] = None
@@ -259,6 +323,7 @@ class _UdpKeepalive:
         while not self._stop.is_set():
             try:
                 self._sock.sendto(DISCOVERY_PROBE, (self.host, UDP_PORT))
+                self._trace(f"udp keepalive tx aim-ka -> {self.host}:{UDP_PORT}")
             except OSError as e:
                 if not self._stop.is_set():
                     self._trace(f"udp keepalive send failed: {e}")
@@ -311,21 +376,35 @@ def parse_discovery(data: bytes, addr: str) -> DiscoveredDevice:
     )
 
 
+def _emit_trace(verbose: bool, trace: Optional[TraceCallback], msg: str) -> None:
+    if trace is not None:
+        trace(msg)
+    if verbose:
+        sys.stderr.write(f"  [aim] {msg}\n")
+        sys.stderr.flush()
+
+
 def discover(
     timeout: float = 2.0,
     hosts: Optional[Iterable[str]] = None,
     verbose: bool = False,
+    trace: Optional[TraceCallback] = None,
 ) -> list[DiscoveredDevice]:
     """Broadcast + unicast `aim-ka` probe, collect replies from UDP :36002."""
     hosts = list(dict.fromkeys(hosts if hosts else DEFAULT_DISCOVERY_HOSTS))
+    _emit_trace(verbose, trace, f"udp discover start hosts={hosts!r} timeout={timeout}s")
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
         sock.bind(("0.0.0.0", UDP_PORT))
+        _emit_trace(verbose, trace, f"udp discover bound 0.0.0.0:{UDP_PORT}")
     except OSError as e:
-        if verbose:
-            sys.stderr.write(f"warning: bind to :{UDP_PORT} failed ({e}); using ephemeral port\n")
+        _emit_trace(
+            verbose,
+            trace,
+            f"warning: udp discover bind :{UDP_PORT} failed ({e}); using ephemeral port",
+        )
     sock.settimeout(0.4)
 
     found: dict[str, DiscoveredDevice] = {}
@@ -338,30 +417,47 @@ def discover(
                 for host in hosts:
                     try:
                         sock.sendto(DISCOVERY_PROBE, (host, UDP_PORT))
+                        _emit_trace(verbose, trace, f"udp discover tx aim-ka -> {host}:{UDP_PORT}")
                     except OSError as e:
-                        if verbose:
-                            sys.stderr.write(f"send to {host}: {e}\n")
+                        _emit_trace(verbose, trace, f"udp discover send to {host}:{UDP_PORT} failed: {e}")
                 next_probe = now + 0.8
             try:
                 data, (addr, src_port) = sock.recvfrom(4096)
             except socket.timeout:
                 continue
-            if verbose:
-                sys.stderr.write(f"rx {len(data)}B from {addr}:{src_port}: {data[:32].hex()}\n")
+            _emit_trace(
+                verbose,
+                trace,
+                f"udp discover rx {len(data)}B from {addr}:{src_port}: "
+                f"{data[:32].hex()}{'...' if len(data) > 32 else ''}",
+            )
             if src_port != UDP_PORT or data == DISCOVERY_PROBE:
+                _emit_trace(
+                    verbose,
+                    trace,
+                    f"udp discover ignored reply from {addr}:{src_port} "
+                    f"(src_port={src_port}, echo={data == DISCOVERY_PROBE})",
+                )
                 continue
             found[addr] = parse_discovery(data, addr)
     finally:
         sock.close()
+        _emit_trace(verbose, trace, f"udp discover closed; found={sorted(found)}")
     return list(found.values())
 
 
 def auto_discover_host(
     timeout: float = AUTO_DISCOVERY_TIMEOUT,
     verbose: bool = False,
+    trace: Optional[TraceCallback] = None,
 ) -> str:
     """Resolve the active logger IP without assuming 10.0.0.1 is fixed."""
-    devices = discover(timeout=timeout, hosts=DEFAULT_DISCOVERY_HOSTS, verbose=verbose)
+    devices = discover(
+        timeout=timeout,
+        hosts=DEFAULT_DISCOVERY_HOSTS,
+        verbose=verbose,
+        trace=trace,
+    )
     addrs = sorted({d.addr for d in devices})
     if not addrs:
         known = ", ".join(KNOWN_AP_HOSTS)
@@ -419,6 +515,13 @@ def _summarize_frame(tag: bytes, payload: bytes) -> str:
     return f"{tag_txt} {n}B  hex={preview}{more}"
 
 
+def _preview_text(text: str, limit: int = 512) -> str:
+    preview = text[:limit]
+    if len(text) > limit:
+        preview += "..."
+    return preview.encode("unicode_escape", errors="backslashreplace").decode("ascii")
+
+
 class AimSession:
     """One TCP connection to the logger. Designed for short-lived per-task use."""
 
@@ -429,12 +532,14 @@ class AimSession:
         timeout: float = 15.0,
         verbose: bool = False,
         bootstrap: bool = True,
+        trace: Optional[TraceCallback] = None,
     ):
         self.host = host
         self.port = port
         self.timeout = timeout
         self.verbose = verbose
         self.bootstrap = bootstrap
+        self.trace = trace
         self.sock: Optional[socket.socket] = None
         self.reader: Optional[FrameReader] = None
         self.device_info: bytes = b""
@@ -453,6 +558,7 @@ class AimSession:
             self.host = auto_discover_host(
                 timeout=min(self.timeout, AUTO_DISCOVERY_TIMEOUT),
                 verbose=self.verbose,
+                trace=self.trace,
             )
             self._trace(f"auto-discovered host {self.host}")
         plans = ("none",) if not self.bootstrap else ("direct", "ping_then_init", "vendor_full")
@@ -469,28 +575,33 @@ class AimSession:
                     time.sleep(KEEPALIVE_PRIME_DELAY)
                 self.sock = socket.create_connection((self.host, self.port), timeout=self.timeout)
                 self.sock.settimeout(self.timeout)
+                self._trace(
+                    f"tcp connected local={self.sock.getsockname()} "
+                    f"peer={self.sock.getpeername()}"
+                )
                 try:
                     self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                    self._trace("tcp nodelay enabled")
                 except OSError:
                     pass
                 if CONNECT_SETTLE_DELAY > 0:
                     self._trace(f"post-connect settle {CONNECT_SETTLE_DELAY:.1f}s")
                     time.sleep(CONNECT_SETTLE_DELAY)
                 on_recv = None
-                if self.verbose:
+                if self.verbose or self.trace is not None:
                     def on_recv(chunk: bytes) -> None:
                         self._trace(
                             f"raw recv {len(chunk)}B: {chunk[:64].hex()}"
                             f"{'...' if len(chunk) > 64 else ''}"
                         )
-                self.reader = FrameReader(self.sock, on_recv=on_recv)
+                self.reader = FrameReader(self.sock, on_recv=on_recv, trace=self._trace)
                 self._hello()
                 if self.bootstrap:
                     self._bootstrap(plan)
                 return
             except (ProtocolError, ConnectionError, socket.timeout, OSError) as e:
                 last_exc = e
-                self._trace(f"bootstrap failed: {e}")
+                self._trace(f"bootstrap failed: {type(e).__name__}: {e}")
                 self.close(abort=True)
                 if attempt >= OPEN_RETRIES:
                     raise
@@ -520,7 +631,7 @@ class AimSession:
                             if not chunk:
                                 peer_closed = True
                                 break
-                            if self.verbose:
+                            if self.verbose or self.trace is not None:
                                 self._trace(
                                     f"close drain {len(chunk)}B: {chunk[:64].hex()}"
                                     f"{'...' if len(chunk) > 64 else ''}"
@@ -560,6 +671,8 @@ class AimSession:
         self.open()
 
     def _trace(self, msg: str) -> None:
+        if self.trace is not None:
+            self.trace(msg)
         if self.verbose:
             sys.stderr.write(f"  [aim] {msg}\n")
             sys.stderr.flush()
@@ -571,15 +684,13 @@ class AimSession:
 
     def _send(self, tag: bytes, payload: bytes) -> None:
         assert self.sock is not None
-        if self.verbose:
-            self._trace(f"tx {_summarize_frame(tag, payload)}")
+        self._trace(f"tx {_summarize_frame(tag, payload)}")
         self.sock.sendall(wrap_frame(tag, payload))
 
     def _recv_frame(self) -> tuple[bytes, bytes]:
         assert self.reader is not None
         tag, pl = self.reader.read()
-        if self.verbose:
-            self._trace(f"rx {_summarize_frame(tag, pl)}")
+        self._trace(f"rx {_summarize_frame(tag, pl)}")
         return tag, pl
 
     def _hello(self) -> None:
@@ -591,8 +702,10 @@ class AimSession:
                 "no hello reply from logger — the device is likely in a stuck "
                 "state from a previous session. Power-cycle the logger and retry."
             )
-        if tag != b"STCP" or len(pl) != 8 or pl[4:6] != b"\x06\x09":
-            sys.stderr.write(f"warning: unexpected hello reply tag={tag!r} payload={pl.hex()}\n")
+        if tag != b"STCP" or len(pl) != 8 or pl[4:6] not in HELLO_REPLY_CODES:
+            msg = f"warning: unexpected hello reply tag={tag!r} payload={pl.hex()}"
+            self._trace(msg)
+            sys.stderr.write(msg + "\n")
 
     def _init(self) -> None:
         """Device-info request + time-sync."""
@@ -664,25 +777,45 @@ class AimSession:
         accept: set[int],
         expected_cmd: Optional[tuple[int, int]] = None,
     ) -> tuple[int, int]:
+        accept_txt = ",".join(_STATUS_NAMES.get(item, f"{item:#010x}") for item in sorted(accept))
+        self._trace(f"wait_status expected_cmd={expected_cmd} accept={accept_txt}")
         exp_cmd = exp_sub = None
         if expected_cmd is not None:
             exp_cmd, exp_sub = expected_cmd
         while True:
             tag, pl = self._recv_frame()
             if tag != b"STCP":
+                self._trace(f"wait_status unexpected tag={tag!r}")
                 raise ProtocolError(f"unexpected non-STCP frame: tag={tag!r}")
             if len(pl) < HDR_SIZE:
+                self._trace(f"wait_status ignoring short STCP payload len={len(pl)}")
                 continue
             cmd, sub, size, status = parse_status(pl)
             if expected_cmd is not None and (cmd, sub) != (exp_cmd, exp_sub):
+                self._trace(
+                    f"wait_status unexpected cmd=0x{cmd:02x}/0x{sub:02x} "
+                    f"want=0x{exp_cmd:02x}/0x{exp_sub:02x}"
+                )
                 raise ProtocolError(
                     f"unexpected status for cmd=0x{cmd:02x}/0x{sub:02x}; "
                     f"want 0x{exp_cmd:02x}/0x{exp_sub:02x}"
                 )
             if status in accept:
+                self._trace(
+                    f"wait_status accepted cmd=0x{cmd:02x}/0x{sub:02x} "
+                    f"size={size} status={status:#010x}"
+                )
                 return size, status
             if status in (STATUS_RECEIVED, STATUS_PENDING):
+                self._trace(
+                    f"wait_status continuing cmd=0x{cmd:02x}/0x{sub:02x} "
+                    f"size={size} status={status:#010x}"
+                )
                 continue
+            self._trace(
+                f"wait_status unexpected status cmd=0x{cmd:02x}/0x{sub:02x} "
+                f"size={size} status={status:#010x}"
+            )
             raise ProtocolError(f"unexpected status {status:#010x}")
 
     def _wait_ready(
@@ -696,6 +829,7 @@ class AimSession:
         )
 
     def _read_stream(self, total: int, progress=None) -> bytes:
+        self._trace(f"stream read start total={total}")
         out = bytearray()
         while len(out) < total:
             self._send(b"STCP", len(out).to_bytes(4, "little"))
@@ -707,39 +841,71 @@ class AimSession:
             if offset != len(out):
                 raise ProtocolError(f"offset mismatch: got {offset} want {len(out)}")
             out.extend(data)
+            self._trace(
+                f"stream chunk offset={offset} data={len(data)} got={len(out)}/{total}"
+            )
             if progress is not None:
                 progress(len(out), total)
+        if len(out) > total:
+            self._trace(f"stream read overrun got={len(out)} total={total}")
+        self._trace(f"stream read complete got={len(out)} total={total}")
         return bytes(out)
 
     def read_file(self, path: str, *, progress=None) -> bytes:
         return self.read_file_result(path, progress=progress).data
 
     def read_file_result(self, path: str, *, progress=None) -> FileReadResult:
+        self._trace(f"read_file start path={path!r}")
         self._send_stnc_cmd(*CMD_FILE_READ, path=path)
         size, status = self._wait_ready(expected_cmd=CMD_FILE_READ)
+        self._trace(f"read_file ready path={path!r} size={size} status={status:#010x}")
         if status == STATUS_EMPTY or size == 0:
             return FileReadResult(b"", size)
-        return FileReadResult(self._read_stream(size, progress=progress), size)
+        data = self._read_stream(size, progress=progress)
+        self._trace(f"read_file complete path={path!r} got={len(data)} ready_size={size}")
+        return FileReadResult(data, size)
 
     def fetch_list_csv(self) -> str:
         """Reproduce the vendor-app list flow: prep x2 → dev.ria probe → 0x24/02."""
+        self._trace("fetch_list_csv start")
         prep_arg = b"\xff\xff\xff\xff"
-        for _ in range(2):
+        for idx in range(2):
+            self._trace(f"fetch_list_csv prep {idx + 1}/2")
             self._send_stnc_cmd(*CMD_LIST_PREP, arg_tail=prep_arg)
             self._wait_ready(expected_cmd=CMD_LIST_PREP)
         cached = self.read_file(LIST_CACHE_PATH)
         if cached:
-            return cached.decode("ascii", errors="replace")
+            self._trace(f"fetch_list_csv dev.ria cache bytes={len(cached)}")
+            cached_text = cached.decode("utf-8-sig", errors="replace")
+            cached_sessions = parse_session_list(cached_text)
+            self._trace(
+                f"fetch_list_csv dev.ria parsed_sessions={len(cached_sessions)} "
+                f"preview={_preview_text(cached_text)}"
+            )
+            if _looks_like_session_list(cached_sessions):
+                self._trace("fetch_list_csv using dev.ria cache")
+                return cached_text
+            self._trace(
+                "dev.ria cache did not look like a session list; "
+                "falling back to 0x24/0x02"
+            )
         return self.fetch_plain_list_csv()
 
     def fetch_plain_list_csv(self) -> str:
+        self._trace("fetch_plain_list_csv start")
         self._send_stnc_cmd(*CMD_LIST)
         size, status = self._wait_ready(expected_cmd=CMD_LIST)
+        self._trace(f"fetch_plain_list_csv ready size={size} status={status:#010x}")
         if status == STATUS_EMPTY or size == 0:
             return ""
-        return self._read_stream(size).decode("ascii", errors="replace")
+        text = self._read_stream(size).decode("ascii", errors="replace")
+        self._trace(
+            f"fetch_plain_list_csv complete chars={len(text)} preview={_preview_text(text)}"
+        )
+        return text
 
     def delete_file(self, path: str) -> int:
+        self._trace(f"delete_file start path={path!r}")
         self._send_stnc_cmd(*CMD_FILE_DELETE, path=path)
         expected_path = path.encode("ascii")
         while True:
@@ -764,17 +930,22 @@ class AimSession:
             if status in (STATUS_READY, STATUS_EMPTY):
                 if size != 0:
                     raise ProtocolError(f"unexpected delete completion size {size}")
+                self._trace(f"delete_file complete path={path!r} status={status:#010x}")
                 return status
             raise ProtocolError(f"unexpected delete status {status:#010x}")
 
     def fetch_device_info(self) -> bytes:
         if self.device_info:
+            self._trace(f"fetch_device_info using cached bytes={len(self.device_info)}")
             return self.device_info
+        self._trace("fetch_device_info start")
         self._send_stnc_cmd(*CMD_DEVINFO, arg_tail=b"\x01", size=DEVINFO_REQ_SIZE)
         size, status = self._wait_ready(expected_cmd=CMD_DEVINFO)
+        self._trace(f"fetch_device_info ready size={size} status={status:#010x}")
         if status == STATUS_EMPTY or size == 0:
             return b""
         self.device_info = self._read_stream(size)
+        self._trace(f"fetch_device_info complete bytes={len(self.device_info)}")
         return self.device_info
 
 
@@ -800,19 +971,28 @@ def parse_session_list(csv_text: str) -> list[Session]:
     """Parse the CSV returned by fetch_list_csv()."""
     if not csv_text.strip():
         return []
-    reader = csv.reader(io.StringIO(csv_text))
+    if csv_text.startswith("\ufeff"):
+        csv_text = csv_text.lstrip("\ufeff")
+    delimiter = _detect_csv_delimiter(csv_text)
+    reader = csv.reader(io.StringIO(csv_text), delimiter=delimiter)
     try:
         header = next(reader)
     except StopIteration:
         return []
-    header = [h.strip() for h in header]
+    header = [h.strip().lstrip("\ufeff") for h in header]
+    has_header = len(header) >= 2 and header[0].lower() == "name" and header[1].lower() == "size"
+    if has_header:
+        columns = header
+    else:
+        columns = SESSION_LIST_COLUMNS[:len(header)]
+        reader = csv.reader(io.StringIO(csv_text), delimiter=delimiter)
     out: list[Session] = []
     for row in reader:
         if not row or not row[0]:
             continue
-        if len(row) < len(header):
-            row = row + [""] * (len(header) - len(row))
-        values = dict(zip(header, row))
+        if len(row) < len(columns):
+            row = row + [""] * (len(columns) - len(row))
+        values = dict(zip(columns, row))
         try:
             size = int(values.get("size", "0") or "0")
         except ValueError:
@@ -834,6 +1014,42 @@ def parse_session_list(csv_text: str) -> list[Session]:
     return out
 
 
+def _detect_csv_delimiter(csv_text: str) -> str:
+    """Pick the delimiter used by the device's list output."""
+    sample_lines = [line for line in csv_text.splitlines() if line.strip()][:5]
+    sample = "\n".join(sample_lines)
+    if not sample:
+        return ","
+    try:
+        dialect = csv.Sniffer().sniff(sample, delimiters=",;\t|")
+        return dialect.delimiter
+    except csv.Error:
+        pass
+    counts = {
+        delim: sum(line.count(delim) for line in sample_lines)
+        for delim in (",", ";", "\t", "|")
+    }
+    best_delim, best_count = max(counts.items(), key=lambda item: item[1])
+    return best_delim if best_count > 0 else ","
+
+
+def _looks_like_session_list(sessions: list[Session]) -> bool:
+    """Reject cache blobs or garbage that happen to parse as rows."""
+    if not sessions:
+        return False
+    for session in sessions:
+        if session.size <= 0:
+            continue
+        if not session.name:
+            continue
+        if "/" in session.name or "\\" in session.name or ";" in session.name or "," in session.name:
+            continue
+        if not SESSION_NAME_RE.fullmatch(session.name):
+            continue
+        return True
+    return False
+
+
 __all__ = [
     "AimSession",
     "DEFAULT_DISCOVERY_HOSTS",
@@ -848,4 +1064,3 @@ __all__ = [
     "parse_status",
     "wrap_frame",
 ]
-

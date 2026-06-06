@@ -36,7 +36,7 @@ Important constraints discovered on real hardware:
 | TCP port `2000`, outer `<h...>` / `<...>` framing | Common |
 | Checksum = `sum(payload) & 0xffff` | Common |
 | About `0.4s` settle after TCP connect and before hello | Important on real hardware |
-| 8-byte hello (`06 08` / `06 09`) exchange | Common and required |
+| 8-byte hello (`06 08` / `06 09` or `06 19`) exchange | Common and required |
 | 64-byte `cmd=0x10/0x01` plus 68-byte time sync bootstrap | Required for list / download / device-info; not needed for delete-only sessions (see §10) |
 | Request `status=0x00000001` marker | Required on some firmware; safest to always send |
 | Continuous UDP `aim-ka` while TCP is active | Common to stable implementations and vendor app |
@@ -286,6 +286,8 @@ S -> C : STCP 8B  00 00 00 00 06 09 00 00
 
 - byte 4 is fixed at `0x06`
 - byte 5 toggles `0x08` -> `0x09`
+- other logger models may reply with byte 5 as `0x19`; if later commands work,
+  treat it as a valid hello ACK variant
 - without this hello exchange, later commands are not accepted
 
 Important real-device finding: some units fail if the hello is sent
